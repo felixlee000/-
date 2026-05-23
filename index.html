@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>本地背单词工具</title>
+    <script>
+      try {
+        const savedTheme = localStorage.getItem("local-vocabulary-tool:theme");
+        document.documentElement.dataset.theme = savedTheme === "dark" ? "dark" : "light";
+      } catch (error) {
+        document.documentElement.dataset.theme = "light";
+      }
+    </script>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-header">
+        <div>
+          <p class="eyebrow">Local Vocabulary</p>
+          <h1>本地背单词工具</h1>
+        </div>
+        <div class="header-actions">
+          <p class="header-note">数据保存在当前浏览器的 localStorage 中</p>
+          <button
+            id="themeToggle"
+            class="theme-toggle"
+            type="button"
+            aria-label="切换夜间模式"
+            aria-pressed="false"
+          >夜间模式</button>
+        </div>
+      </header>
+
+      <main id="app" class="app-main" aria-live="polite"></main>
+    </div>
+
+    <script src="app.js"></script>
+  </body>
+</html>
