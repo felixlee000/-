@@ -87,6 +87,8 @@ abandon,放弃；抛弃
 beneficial,有益的
 ```
 
+导入会自动识别常见 CSV 编码，包括 `UTF-8`、`UTF-8 with BOM`、`GB18030` 和 `GBK`，可避免中文解释读入后变成乱码。
+
 导出的 CSV 会包含更多学习记录字段：
 
 ```csv

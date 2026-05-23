@@ -779,14 +779,52 @@ function openCsvPicker(listId) {
   input.click();
 }
 
+function decodeCsvText(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const bomDecoders = [
+    { bom: [0xff, 0xfe], encoding: "utf-16le" },
+    { bom: [0xfe, 0xff], encoding: "utf-16be" },
+    { bom: [0xef, 0xbb, 0xbf], encoding: "utf-8" },
+  ];
+
+  for (const { bom, encoding } of bomDecoders) {
+    if (bom.every((byte, index) => bytes[index] === byte)) {
+      return new TextDecoder(encoding).decode(bytes);
+    }
+  }
+
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    const chineseEncodings = ["gb18030", "gbk"];
+    for (const encoding of chineseEncodings) {
+      try {
+        return new TextDecoder(encoding).decode(bytes);
+      } catch {
+        // Some older browsers may not ship every legacy decoder.
+      }
+    }
+  }
+
+  return new TextDecoder("utf-8").decode(bytes);
+}
+
+function readFileAsArrayBuffer(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.addEventListener("load", () => resolve(reader.result));
+    reader.addEventListener("error", () => reject(reader.error));
+    reader.readAsArrayBuffer(file);
+  });
+}
+
 function importCsvFile(listId, file) {
   const list = getListById(listId);
   if (!list) return;
 
-  const reader = new FileReader();
-  reader.addEventListener("load", () => {
-    try {
-      const entries = parseImportedEntries(reader.result);
+  readFileAsArrayBuffer(file)
+    .then((buffer) => {
+      const entries = parseImportedEntries(decodeCsvText(buffer));
       if (!entries.length) {
         alert("没有找到可导入的词条。请确认 CSV 至少包含 word 和 meaning 两列。");
         return;
@@ -797,15 +835,11 @@ function importCsvFile(listId, file) {
       saveData();
       render();
       alert(`已导入 ${entries.length} 条词条。`);
-    } catch (error) {
+    })
+    .catch((error) => {
       console.error("导入 CSV 失败：", error);
-      alert("导入 CSV 失败，请检查文件格式。");
-    }
-  });
-  reader.addEventListener("error", () => {
-    alert("读取 CSV 文件失败，请重试。");
-  });
-  reader.readAsText(file, "UTF-8");
+      alert("导入 CSV 失败，请检查文件格式或文件编码。");
+    });
 }
 
 function escapeCsvCell(value) {
