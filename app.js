@@ -3,6 +3,9 @@
 
 const STORAGE_KEY = "local-vocabulary-tool:v1";
 const THEME_STORAGE_KEY = "local-vocabulary-tool:theme";
+const AIM_TARGET_LIFETIME_MS = 6000;
+const AIM_OPTION_COUNT = 5;
+const AIM_CORRECT_ADVANCE_MS = 420;
 
 const app = document.querySelector("#app");
 const themeToggle = document.querySelector("#themeToggle");
@@ -12,10 +15,12 @@ const state = {
   currentView: "list",
   activeListId: null,
   test: null,
+  aimTestSession: null,
   combinedSettings: {
     selectedListIds: [],
     scope: "all",
     limit: "30",
+    testForm: "normal",
   },
   helpExpanded: true,
   draggedEntryId: null,
@@ -461,9 +466,11 @@ function deleteList(listId) {
 }
 
 function openList(listId) {
+  cleanupAimRoundTimers();
   state.activeListId = listId;
   state.currentView = "edit";
   state.test = null;
+  state.aimTestSession = null;
   state.noteModal = null;
   render();
 }
@@ -943,6 +950,8 @@ function startTest(listId, scope = "all") {
     return;
   }
 
+  cleanupAimRoundTimers();
+  state.aimTestSession = null;
   state.activeListId = listId;
   state.currentView = "test";
   state.noteModal = null;
@@ -1153,10 +1162,12 @@ function getSmartRecommendedWords(options = {}) {
   return applyQuestionLimit(words, options.limit ?? 30);
 }
 
-function openCombinedTestSettings() {
+function openCombinedTestSettings(testForm) {
+  cleanupAimRoundTimers();
   state.currentView = "combined";
   state.activeListId = null;
   state.test = null;
+  state.aimTestSession = null;
   state.noteModal = null;
 
   const existingSelection = state.combinedSettings.selectedListIds.filter((listId) =>
@@ -1166,8 +1177,13 @@ function openCombinedTestSettings() {
     selectedListIds: existingSelection.length ? existingSelection : state.lists.map((list) => list.id),
     scope: state.combinedSettings.scope || "all",
     limit: String(state.combinedSettings.limit || "30"),
+    testForm: testForm || state.combinedSettings.testForm || "normal",
   };
   render();
+}
+
+function openAimTestSettings() {
+  openCombinedTestSettings("aim");
 }
 
 function setCombinedListSelected(listId, selected) {
@@ -1196,6 +1212,24 @@ function updateCombinedLimit(limit) {
   render();
 }
 
+function updateCombinedTestForm(testForm) {
+  state.combinedSettings.testForm = testForm === "aim" ? "aim" : "normal";
+  render();
+}
+
+function startCombinedFromSettings() {
+  if (state.combinedSettings.testForm === "aim") {
+    startAimTest({
+      ...state.combinedSettings,
+      type: "combined",
+      source: "combined",
+    });
+    return;
+  }
+
+  startCombinedTest(state.combinedSettings);
+}
+
 function startSmartReviewFromHome() {
   const selectedListIds = state.lists.map((list) => list.id);
   startCombinedTest({
@@ -1206,17 +1240,17 @@ function startSmartReviewFromHome() {
   });
 }
 
-function startCombinedTest(config) {
+function prepareCombinedWords(config) {
   const selectedListIds = (config.selectedListIds || []).filter((listId) => getListById(listId));
   if (!selectedListIds.length) {
     alert("请至少选择一个词表。");
-    return;
+    return null;
   }
 
   const allWords = collectWordsFromLists(selectedListIds);
   if (!allWords.length) {
     alert("没有可测试词条，请先添加单词和解释。");
-    return;
+    return null;
   }
 
   const scope = config.scope || "all";
@@ -1242,14 +1276,14 @@ function startCombinedTest(config) {
       else if (scope === "wrong") alert("所选词表没有可测试的错题词。");
       else if (scope === "due") alert("没有到期词，可选择智能混合推荐。");
       else alert("没有可测试词条，请先添加单词和解释。");
-      return;
+      return null;
     }
     selectedWords = applyQuestionLimit(shuffle(selectedWords), config.limit ?? 30);
   }
 
   if (!selectedWords.length) {
     alert("没有可测试词条，请先添加单词和解释。");
-    return;
+    return null;
   }
 
   const normalizedConfig = {
@@ -1259,6 +1293,22 @@ function startCombinedTest(config) {
     auto: Boolean(config.auto),
   };
 
+  return {
+    selectedListIds,
+    scope,
+    selectedWords,
+    normalizedConfig,
+  };
+}
+
+function startCombinedTest(config) {
+  const prepared = prepareCombinedWords(config);
+  if (!prepared) return;
+
+  const { scope, selectedWords, normalizedConfig } = prepared;
+
+  cleanupAimRoundTimers();
+  state.aimTestSession = null;
   state.activeListId = null;
   state.currentView = "test";
   state.noteModal = null;
@@ -1286,6 +1336,524 @@ function startCombinedTest(config) {
   });
 }
 
+// ---------- 射击训练模式 ----------
+
+function startAimTest(config = {}) {
+  const type = config.type === "single" || config.listId ? "single" : "combined";
+  let selectedWords = [];
+  let selectedListIds = [];
+  let scope = config.scope || "all";
+  let title = "射击训练模式";
+  let restartConfig = { ...config, type };
+
+  if (type === "single") {
+    const list = getListById(config.listId);
+    if (!list) return;
+
+    scope = scope === true ? "favorite" : scope || "all";
+    const entries = getValidEntries(list, scope);
+    if (!entries.length) {
+      alert(getEmptyTestMessage(scope));
+      return;
+    }
+
+    selectedListIds = [list.id];
+    selectedWords = applyQuestionLimit(
+      shuffle(entries.map((entry) => createTestWordRef(list, entry))),
+      config.limit ?? "all"
+    );
+    title = `${list.name}：单词射击训练`;
+    restartConfig = {
+      type: "single",
+      listId: list.id,
+      scope,
+      limit: config.limit ?? "all",
+    };
+    state.activeListId = list.id;
+  } else {
+    const prepared = prepareCombinedWords(config);
+    if (!prepared) return;
+
+    selectedListIds = prepared.selectedListIds;
+    selectedWords = prepared.selectedWords;
+    scope = prepared.scope;
+    title = scope === "smart" ? "智能推荐射击训练" : "综合射击训练";
+    restartConfig = {
+      ...prepared.normalizedConfig,
+      type: "combined",
+      source: config.source || "combined",
+    };
+    state.activeListId = null;
+  }
+
+  const candidateWords = collectWordsFromLists(selectedListIds);
+
+  cleanupAimRoundTimers();
+  state.test = null;
+  state.noteModal = null;
+  state.currentView = "aim-test";
+  state.aimTestSession = {
+    type,
+    source: type === "single" ? "list" : config.source || "combined",
+    mode: scope,
+    title,
+    selectedListIds,
+    words: selectedWords,
+    candidateWords,
+    currentIndex: 0,
+    score: 0,
+    combo: 0,
+    maxCombo: 0,
+    correctCount: 0,
+    wrongCount: 0,
+    answeredMap: {},
+    wrongEntries: [],
+    optionCount: Number(config.optionCount) || AIM_OPTION_COUNT,
+    targetLifetimeMs: Number(config.targetLifetimeMs) || AIM_TARGET_LIFETIME_MS,
+    currentOptions: [],
+    roundStartedAt: null,
+    roundAnswered: false,
+    paused: false,
+    remainingTimeMs: Number(config.targetLifetimeMs) || AIM_TARGET_LIFETIME_MS,
+    animationFrameId: null,
+    correctAdvanceTimeoutId: null,
+    feedbackModal: null,
+    flashMessage: "",
+    restartConfig,
+    finished: false,
+  };
+
+  startAimRound();
+}
+
+function startAimTestForList(listId) {
+  startAimTest({
+    type: "single",
+    listId,
+    scope: "all",
+    limit: "all",
+  });
+}
+
+function getAimCurrentRef() {
+  return state.aimTestSession?.words?.[state.aimTestSession.currentIndex] || null;
+}
+
+function getAimEntryWord(entry) {
+  if (!entry) return null;
+  return getWordBySource(entry.sourceListId, entry.wordId);
+}
+
+function isSameAimEntry(a, b) {
+  return Boolean(a && b && a.sourceListId === b.sourceListId && a.wordId === b.wordId);
+}
+
+function getAimAnswerKey(entry, roundIndex) {
+  return `${entry.sourceListId}_${entry.wordId}_${roundIndex}`;
+}
+
+function getAimCandidateEntries() {
+  const session = state.aimTestSession;
+  if (!session) return [];
+  return session.candidateWords?.length ? session.candidateWords : session.words;
+}
+
+function uniqueAimEntries(entries) {
+  const seen = new Set();
+  return entries.filter((entry) => {
+    const word = getAimEntryWord(entry);
+    if (!word || !isValidWord(word)) return false;
+
+    const key = getTestWordKey(entry);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function getDistractorEntries(targetEntry, candidateEntries, count) {
+  if (count <= 0) return [];
+
+  const primaryPool = uniqueAimEntries(candidateEntries).filter(
+    (entry) => !isSameAimEntry(entry, targetEntry)
+  );
+  const fallbackPool = uniqueAimEntries(
+    collectWordsFromLists(state.lists.map((list) => list.id))
+  ).filter((entry) => !isSameAimEntry(entry, targetEntry));
+
+  const merged = uniqueAimEntries([...primaryPool, ...fallbackPool]).filter(
+    (entry) => !isSameAimEntry(entry, targetEntry)
+  );
+
+  return shuffle(merged).slice(0, count);
+}
+
+function generateRandomTargetPositions(count) {
+  const positions = [];
+  const minDistance = count > 4 ? 21 : 26;
+
+  for (let index = 0; index < count; index += 1) {
+    let position = null;
+
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      const candidate = {
+        x: 16 + Math.random() * 68,
+        y: 18 + Math.random() * 64,
+      };
+      const hasRoom = positions.every((item) => {
+        const dx = item.x - candidate.x;
+        const dy = item.y - candidate.y;
+        return Math.sqrt(dx * dx + dy * dy) >= minDistance;
+      });
+
+      if (hasRoom) {
+        position = candidate;
+        break;
+      }
+    }
+
+    positions.push(
+      position || {
+        x: 16 + Math.random() * 68,
+        y: 18 + Math.random() * 64,
+      }
+    );
+  }
+
+  return positions;
+}
+
+function buildAimRoundOptions(targetEntry, allCandidateEntries, optionCount = AIM_OPTION_COUNT) {
+  const targetWord = getAimEntryWord(targetEntry);
+  if (!targetWord || !isValidWord(targetWord)) return [];
+
+  const distractors = getDistractorEntries(targetEntry, allCandidateEntries, optionCount - 1);
+  const optionRefs = shuffle([targetEntry, ...distractors]);
+  const positions = generateRandomTargetPositions(optionRefs.length);
+
+  return optionRefs.map((entry, index) => {
+    const word = getAimEntryWord(entry);
+    return {
+      ...entry,
+      word: word?.word || "",
+      meaning: word?.meaning || "",
+      isCorrect: isSameAimEntry(entry, targetEntry),
+      x: positions[index].x,
+      y: positions[index].y,
+    };
+  });
+}
+
+function startAimRound() {
+  const session = state.aimTestSession;
+  if (!session || session.finished) return;
+
+  cleanupAimRoundTimers();
+  const targetEntry = getAimCurrentRef();
+  const targetWord = getAimEntryWord(targetEntry);
+
+  if (!targetEntry || !targetWord || !isValidWord(targetWord)) {
+    goToNextAimRound();
+    return;
+  }
+
+  session.currentOptions = buildAimRoundOptions(
+    targetEntry,
+    getAimCandidateEntries(),
+    session.optionCount
+  );
+  session.roundStartedAt = performance.now();
+  session.roundAnswered = false;
+  session.paused = false;
+  session.remainingTimeMs = session.targetLifetimeMs;
+  session.feedbackModal = null;
+  session.flashMessage = "";
+
+  render();
+  session.animationFrameId = requestAnimationFrame(updateAimAnimation);
+}
+
+function getAimRemainingTimeMs() {
+  const session = state.aimTestSession;
+  if (!session) return 0;
+  if (session.paused || session.roundAnswered) return Math.max(session.remainingTimeMs, 0);
+  if (!session.roundStartedAt) return session.targetLifetimeMs;
+
+  const elapsed = performance.now() - session.roundStartedAt;
+  return Math.max(session.targetLifetimeMs - elapsed, 0);
+}
+
+function getAimRoundProgress() {
+  const session = state.aimTestSession;
+  if (!session?.targetLifetimeMs) return 0;
+  return Math.min(1, 1 - getAimRemainingTimeMs() / session.targetLifetimeMs);
+}
+
+function formatAimTime(ms) {
+  return `${Math.max(0, ms / 1000).toFixed(1)}s`;
+}
+
+function getAimTargetScale(progress = getAimRoundProgress()) {
+  return Math.max(0.25, 1 - progress * 0.75);
+}
+
+function getAimTargetOpacity(progress = getAimRoundProgress()) {
+  return Math.max(0.5, 1 - progress * 0.45);
+}
+
+function updateAimAnimation(timestamp = performance.now()) {
+  const session = state.aimTestSession;
+  if (
+    !session ||
+    state.currentView !== "aim-test" ||
+    session.finished ||
+    session.paused ||
+    session.roundAnswered
+  ) {
+    return;
+  }
+
+  const elapsed = timestamp - session.roundStartedAt;
+  const progress = Math.min(elapsed / session.targetLifetimeMs, 1);
+  const remaining = Math.max(session.targetLifetimeMs - elapsed, 0);
+  const scale = getAimTargetScale(progress);
+  const opacity = getAimTargetOpacity(progress);
+
+  session.remainingTimeMs = remaining;
+
+  const timer = app.querySelector("[data-aim-timer]");
+  const timerBar = app.querySelector("[data-aim-timer-bar]");
+  if (timer) timer.textContent = formatAimTime(remaining);
+  if (timerBar) timerBar.style.width = `${Math.max(0, 100 - progress * 100)}%`;
+
+  app.querySelectorAll("[data-aim-target]").forEach((target) => {
+    target.style.transform = `translate(-50%, -50%) scale(${scale})`;
+    target.style.opacity = String(opacity);
+  });
+
+  if (progress >= 1) {
+    handleAimTimeout();
+    return;
+  }
+
+  session.animationFrameId = requestAnimationFrame(updateAimAnimation);
+}
+
+function handleAimTargetClick(optionEntry) {
+  const session = state.aimTestSession;
+  if (!session || session.roundAnswered || session.paused || session.feedbackModal) return;
+
+  const targetEntry = getAimCurrentRef();
+  if (!targetEntry) return;
+
+  if (isSameAimEntry(optionEntry, targetEntry)) {
+    handleAimCorrectClick(targetEntry);
+  } else {
+    handleAimWrongClick(targetEntry, optionEntry);
+  }
+}
+
+function recordAimRoundAnswer(result, targetEntry, clickedEntry = null) {
+  const session = state.aimTestSession;
+  if (!session || session.roundAnswered) return null;
+
+  const answerKey = getAimAnswerKey(targetEntry, session.currentIndex);
+  if (session.answeredMap[answerKey]) return null;
+
+  const targetWord = getAimEntryWord(targetEntry);
+  const targetList = getListById(targetEntry.sourceListId);
+  if (!targetWord || !targetList) return null;
+
+  session.remainingTimeMs = getAimRemainingTimeMs();
+  session.roundAnswered = true;
+  cleanupAimRoundTimers();
+
+  const isCorrect = result === "correct";
+  updateReviewSchedule(targetWord, isCorrect);
+
+  let points = 0;
+  if (isCorrect) {
+    const timeBonus = Math.round((session.remainingTimeMs / session.targetLifetimeMs) * 50);
+    const comboBonus = Math.min(session.combo * 5, 50);
+    points = 100 + timeBonus + comboBonus;
+
+    session.score += points;
+    session.combo += 1;
+    session.maxCombo = Math.max(session.maxCombo, session.combo);
+    session.correctCount += 1;
+  } else {
+    session.combo = 0;
+    session.wrongCount += 1;
+    session.wrongEntries.push({ ...targetEntry });
+  }
+
+  session.answeredMap[answerKey] = {
+    result,
+    clickedWordId: clickedEntry?.wordId || null,
+    clickedSourceListId: clickedEntry?.sourceListId || null,
+    answeredAt: nowIso(),
+  };
+
+  targetList.updatedAt = nowIso();
+  saveData();
+  return { points, targetWord };
+}
+
+function handleAimCorrectClick(targetEntry) {
+  const session = state.aimTestSession;
+  const record = recordAimRoundAnswer("correct", targetEntry);
+  if (!session || !record) return;
+
+  session.flashMessage = `正确 +${record.points}`;
+  render();
+  session.correctAdvanceTimeoutId = window.setTimeout(goToNextAimRound, AIM_CORRECT_ADVANCE_MS);
+}
+
+function handleAimWrongClick(targetEntry, clickedEntry) {
+  const record = recordAimRoundAnswer("wrong", targetEntry, clickedEntry);
+  if (!record) return;
+  showAimFeedbackModal("wrong", targetEntry, clickedEntry);
+}
+
+function handleAimTimeout() {
+  const targetEntry = getAimCurrentRef();
+  if (!targetEntry) return;
+
+  const record = recordAimRoundAnswer("timeout", targetEntry);
+  if (!record) return;
+  showAimFeedbackModal("timeout", targetEntry);
+}
+
+function showAimFeedbackModal(type, targetEntry, clickedEntry = null) {
+  const session = state.aimTestSession;
+  if (!session) return;
+
+  session.feedbackModal = {
+    type,
+    targetEntry: { ...targetEntry },
+    clickedEntry: clickedEntry ? { ...clickedEntry } : null,
+  };
+  render();
+}
+
+function closeAimFeedbackModal() {
+  const session = state.aimTestSession;
+  if (!session) return;
+  session.feedbackModal = null;
+  render();
+}
+
+function continueAimTest() {
+  closeAimFeedbackModal();
+  goToNextAimRound();
+}
+
+function goToNextAimRound() {
+  const session = state.aimTestSession;
+  if (!session) return;
+
+  cleanupAimRoundTimers();
+  const nextIndex = session.currentIndex + 1;
+  if (nextIndex >= session.words.length) {
+    finishAimTest();
+    return;
+  }
+
+  session.currentIndex = nextIndex;
+  startAimRound();
+}
+
+function finishAimTest() {
+  const session = state.aimTestSession;
+  if (!session) return;
+
+  cleanupAimRoundTimers();
+  session.finished = true;
+  session.currentOptions = [];
+  session.feedbackModal = null;
+  session.flashMessage = "";
+  session.paused = false;
+  render();
+}
+
+function pauseAimTest() {
+  const session = state.aimTestSession;
+  if (!session || session.finished || session.roundAnswered || session.feedbackModal || session.paused) {
+    return;
+  }
+
+  session.remainingTimeMs = getAimRemainingTimeMs();
+  session.paused = true;
+  cleanupAimRoundTimers();
+  render();
+}
+
+function resumeAimTest() {
+  const session = state.aimTestSession;
+  if (!session || !session.paused || session.finished || session.roundAnswered) return;
+
+  const elapsedBeforePause = session.targetLifetimeMs - session.remainingTimeMs;
+  session.roundStartedAt = performance.now() - elapsedBeforePause;
+  session.paused = false;
+  render();
+  session.animationFrameId = requestAnimationFrame(updateAimAnimation);
+}
+
+function restartAimTest() {
+  const restartConfig = state.aimTestSession?.restartConfig;
+  if (!restartConfig) return;
+  startAimTest(restartConfig);
+}
+
+function exitAimTest(destination = "home") {
+  const session = state.aimTestSession;
+  const returnListId = session?.type === "single" ? session.selectedListIds?.[0] : null;
+
+  cleanupAimRoundTimers();
+  state.aimTestSession = null;
+  state.test = null;
+  state.noteModal = null;
+
+  if (destination === "settings" || (destination === "source" && session?.type === "combined")) {
+    state.currentView = "combined";
+    state.activeListId = null;
+  } else if (destination === "source" && returnListId && getListById(returnListId)) {
+    state.currentView = "edit";
+    state.activeListId = returnListId;
+  } else {
+    state.currentView = "list";
+    state.activeListId = null;
+  }
+
+  render();
+}
+
+function cleanupAimRoundTimers() {
+  const session = state.aimTestSession;
+  if (!session) return;
+
+  if (session.animationFrameId) {
+    cancelAnimationFrame(session.animationFrameId);
+    session.animationFrameId = null;
+  }
+
+  if (session.correctAdvanceTimeoutId) {
+    clearTimeout(session.correctAdvanceTimeoutId);
+    session.correctAdvanceTimeoutId = null;
+  }
+}
+
+function toggleAimFavorite(entryRef) {
+  const word = getAimEntryWord(entryRef);
+  const list = getListById(entryRef?.sourceListId);
+  if (!word || !list) return;
+
+  word.favorite = !word.favorite;
+  list.updatedAt = nowIso();
+  saveData();
+  render();
+}
+
 function toggleHelpSection() {
   state.helpExpanded = !state.helpExpanded;
   render();
@@ -1306,6 +1874,11 @@ function render() {
 
   if (state.currentView === "test") {
     renderTestView();
+    return;
+  }
+
+  if (state.currentView === "aim-test") {
+    renderAimTestPage();
     return;
   }
 
@@ -1364,6 +1937,7 @@ function renderCombinedTestEntry() {
       <div class="row-actions">
         <button class="button" data-action="open-combined-settings" ${hasLists ? "" : "disabled"}>手动选择词表</button>
         <button class="button ghost" data-action="smart-combined-test" ${hasValidWords ? "" : "disabled"}>智能复习推荐</button>
+        <button class="button ghost" data-action="open-aim-settings" ${hasValidWords ? "" : "disabled"}>射击训练</button>
       </div>
       ${
         hasLists
@@ -1378,6 +1952,7 @@ function renderCombinedTestSettingsPage() {
   const selectedIds = new Set(state.combinedSettings.selectedListIds);
   const allSelected = state.lists.length > 0 && state.lists.every((list) => selectedIds.has(list.id));
   const selectedCount = state.combinedSettings.selectedListIds.length;
+  const isAimForm = state.combinedSettings.testForm === "aim";
 
   app.innerHTML = `
     <section class="view">
@@ -1385,12 +1960,12 @@ function renderCombinedTestSettingsPage() {
 
       <div class="panel view-title-row">
         <div>
-          <h2>综合测试设置</h2>
-          <p class="muted">选择要参与测试的词表，设置范围和本轮抽题数量。</p>
+          <h2>${isAimForm ? "射击训练设置" : "综合测试设置"}</h2>
+          <p class="muted">选择要参与测试的词表，设置范围、本轮抽题数量和测试形式。</p>
         </div>
         <div class="row-actions">
           <button class="button secondary" data-action="back-list">返回主页</button>
-          <button class="button" data-action="start-combined-test" ${selectedCount ? "" : "disabled"}>开始综合测试</button>
+          <button class="button" data-action="start-combined-test" ${selectedCount ? "" : "disabled"}>${isAimForm ? "开始射击训练" : "开始综合测试"}</button>
         </div>
       </div>
 
@@ -1410,6 +1985,23 @@ function renderCombinedTestSettingsPage() {
             ? renderCombinedListOptions(selectedIds)
             : `<div class="empty-state"><h3>还没有词表</h3><p class="muted">请先返回主页创建词表。</p></div>`
         }
+      </section>
+
+      <section class="panel combined-options">
+        <div>
+          <h3>测试形式</h3>
+          <div class="scope-options">
+            ${renderTestFormOption("normal", "普通默写测试")}
+            ${renderTestFormOption("aim", "射击训练模式")}
+          </div>
+        </div>
+        <div>
+          <h3>射击参数</h3>
+          <div class="aim-setting-summary">
+            <span>每题时间：6 秒</span>
+            <span>干扰词：默认 4 个</span>
+          </div>
+        </div>
       </section>
 
       <section class="panel combined-options">
@@ -1481,6 +2073,21 @@ function renderScopeOption(value, label) {
         value="${value}"
         data-combined-scope
         ${state.combinedSettings.scope === value ? "checked" : ""}
+      />
+      <span>${label}</span>
+    </label>
+  `;
+}
+
+function renderTestFormOption(value, label) {
+  return `
+    <label class="scope-option">
+      <input
+        type="radio"
+        name="combinedTestForm"
+        value="${value}"
+        data-combined-test-form
+        ${state.combinedSettings.testForm === value ? "checked" : ""}
       />
       <span>${label}</span>
     </label>
@@ -1568,6 +2175,7 @@ function renderListCards() {
             <button class="button small ghost" data-action="start-test" data-list-id="${list.id}">全部练习</button>
             <button class="button small ghost" data-action="start-favorite-test" data-list-id="${list.id}">只练收藏</button>
             <button class="button small ghost" data-action="start-wrong-test" data-list-id="${list.id}">练错题</button>
+            <button class="button small ghost" data-action="start-aim-test" data-list-id="${list.id}">射击训练</button>
             <button class="button small secondary" data-action="rename-list" data-list-id="${list.id}">重命名</button>
             <button class="button small danger" data-action="delete-list" data-list-id="${list.id}">删除</button>
           </div>
@@ -1614,6 +2222,7 @@ function renderEditView() {
           <button class="button ghost" data-action="start-favorite-test" data-list-id="${list.id}">只练收藏</button>
           <button class="button ghost" data-action="start-wrong-test" data-list-id="${list.id}">练错题</button>
           <button class="button ghost" data-action="start-test" data-list-id="${list.id}">全部练习</button>
+          <button class="button ghost" data-action="start-aim-test" data-list-id="${list.id}">射击训练</button>
           <button class="button" data-action="add-entry" data-list-id="${list.id}">+ 添加新词条</button>
         </div>
       </div>
@@ -2036,6 +2645,269 @@ function renderFinishedTest() {
   `;
 }
 
+function renderAimTestPage() {
+  const session = state.aimTestSession;
+  if (!session) {
+    state.currentView = "list";
+    renderListView();
+    return;
+  }
+
+  if (session.finished) {
+    app.innerHTML = `
+      <section class="view aim-test-page">
+        ${renderStorageWarning()}
+        ${renderAimResultPage()}
+      </section>
+    `;
+    return;
+  }
+
+  const targetEntry = getAimCurrentRef();
+  const targetWord = getAimEntryWord(targetEntry);
+  if (!targetEntry || !targetWord) {
+    app.innerHTML = `
+      <section class="view">
+        <div class="empty-state">
+          <h3>当前题目不可用</h3>
+          <p class="muted">这个词条可能已经被删除，请重新开始训练。</p>
+          <button class="button" data-action="exit-aim-test">返回主页</button>
+        </div>
+      </section>
+    `;
+    return;
+  }
+
+  const total = session.words.length;
+  const current = session.currentIndex + 1;
+  const answeredCount = session.correctCount + session.wrongCount;
+  const progress = Math.round((answeredCount / total) * 100);
+  const rangeLabel = getTestScopeLabel(session.mode);
+  const remaining = session.remainingTimeMs;
+
+  app.innerHTML = `
+    <section class="view aim-test-page">
+      ${renderStorageWarning()}
+
+      <div class="aim-top-bar">
+        <div class="aim-status">
+          <span><strong>射击训练模式</strong></span>
+          <span>范围：${escapeHtml(rangeLabel)}</span>
+          <span>进度：${current} / ${total}</span>
+          <span class="aim-score">得分：${session.score}</span>
+          <span class="aim-combo">连击：${session.combo}</span>
+          <span>正确：${session.correctCount}</span>
+          <span>错误：${session.wrongCount}</span>
+          <span class="aim-timer">剩余：<strong data-aim-timer>${formatAimTime(remaining)}</strong></span>
+        </div>
+        <div class="row-actions">
+          ${
+            session.type === "combined"
+              ? `<button class="button secondary" data-action="back-aim-settings">返回设置</button>`
+              : `<button class="button secondary" data-action="back-aim-source">返回词表</button>`
+          }
+          <button class="button ghost" data-action="exit-aim-test">退出训练</button>
+        </div>
+      </div>
+
+      <div class="aim-progress" aria-label="射击训练进度">
+        <div class="progress-bar" style="width: ${progress}%"></div>
+      </div>
+
+      <section class="aim-prompt" aria-live="polite">
+        <p class="label">请选择对应单词：</p>
+        <p class="meaning-text">${escapeHtml(targetWord.meaning)}</p>
+        ${
+          session.type === "combined"
+            ? `<p class="source-list-label">来源词表：${escapeHtml(targetEntry.sourceListName || "")}</p>`
+            : ""
+        }
+      </section>
+
+      <section class="aim-arena" aria-label="单词目标区域">
+        <div class="aim-timer-track">
+          <div data-aim-timer-bar style="width: ${(remaining / session.targetLifetimeMs) * 100}%"></div>
+        </div>
+        ${renderAimTargets(session.currentOptions)}
+        ${session.flashMessage ? `<div class="aim-hit-flash">${escapeHtml(session.flashMessage)}</div>` : ""}
+        ${session.paused ? renderAimPauseOverlay() : ""}
+      </section>
+
+      <div class="aim-bottom-controls">
+        <button class="button secondary" data-action="pause-aim-test" ${
+          session.roundAnswered || session.feedbackModal || session.paused ? "disabled" : ""
+        }>暂停</button>
+        <button class="button ghost" data-action="exit-aim-test">退出训练</button>
+      </div>
+    </section>
+    ${renderAimFeedbackModal()}
+  `;
+}
+
+function renderAimTargets(options) {
+  const session = state.aimTestSession;
+  const progress = getAimRoundProgress();
+  const scale = getAimTargetScale(progress);
+  const opacity = getAimTargetOpacity(progress);
+
+  return options
+    .map((option) => {
+      const isClickedWrong =
+        session?.feedbackModal?.type === "wrong" &&
+        isSameAimEntry(option, session.feedbackModal.clickedEntry);
+      const isCorrectFlash = session?.flashMessage && option.isCorrect;
+      const className = [
+        "aim-target",
+        session?.roundAnswered ? "shrinking" : "",
+        isCorrectFlash ? "correct-flash" : "",
+        isClickedWrong ? "wrong-flash" : "",
+      ]
+        .filter(Boolean)
+        .join(" ");
+
+      return `
+        <button
+          class="${className}"
+          type="button"
+          data-action="aim-target-click"
+          data-aim-target
+          data-source-list-id="${option.sourceListId}"
+          data-word-id="${option.wordId}"
+          style="left: ${option.x}%; top: ${option.y}%; transform: translate(-50%, -50%) scale(${scale}); opacity: ${opacity};"
+        >${escapeHtml(option.word)}</button>
+      `;
+    })
+    .join("");
+}
+
+function renderAimPauseOverlay() {
+  return `
+    <div class="aim-pause-overlay" role="dialog" aria-modal="true">
+      <div>
+        <h2>训练已暂停</h2>
+        <p class="muted">当前题目计时已经停止。</p>
+        <div class="row-actions">
+          <button class="button" data-action="resume-aim-test">继续训练</button>
+          <button class="button ghost" data-action="exit-aim-test">退出训练</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderAimFeedbackModal() {
+  const session = state.aimTestSession;
+  const modal = session?.feedbackModal;
+  if (!session || !modal) return "";
+
+  const targetWord = getAimEntryWord(modal.targetEntry);
+  const clickedWord = getAimEntryWord(modal.clickedEntry);
+  const isTimeout = modal.type === "timeout";
+
+  return `
+    <div class="aim-feedback-backdrop" role="presentation">
+      <section class="aim-feedback-modal" role="dialog" aria-modal="true" aria-labelledby="aimFeedbackTitle">
+        <div>
+          <p class="eyebrow">FPS Training</p>
+          <h2 id="aimFeedbackTitle">${isTimeout ? "时间到" : "选择错误"}</h2>
+          <p class="muted">${
+            isTimeout ? "你没有在限定时间内选中正确单词。" : "你点击了错误单词。"
+          }</p>
+        </div>
+
+        <div class="aim-feedback-block">
+          <span>中文解释</span>
+          <strong>${escapeHtml(targetWord?.meaning || "词条已删除")}</strong>
+        </div>
+        <div class="aim-feedback-block">
+          <span>正确单词</span>
+          <strong>${escapeHtml(targetWord?.word || "词条已删除")}</strong>
+        </div>
+
+        ${
+          isTimeout
+            ? ""
+            : `<div class="aim-feedback-block wrong-picked">
+                <span>你点击的是</span>
+                <strong>${escapeHtml(clickedWord?.word || "词条已删除")}</strong>
+                <p>${escapeHtml(clickedWord?.meaning || "没有可显示的解释。")}</p>
+              </div>`
+        }
+
+        ${targetWord ? renderAimWordStats(targetWord) : ""}
+
+        <div class="aim-modal-actions">
+          ${targetWord ? renderAimFavoriteAction(modal.targetEntry, isTimeout ? "当前词" : "正确词") : ""}
+          ${
+            !isTimeout && clickedWord && !isSameAimEntry(modal.targetEntry, modal.clickedEntry)
+              ? renderAimFavoriteAction(modal.clickedEntry, "误点词")
+              : ""
+          }
+          <button class="button" data-action="continue-aim-test">继续</button>
+          <button class="button ghost" data-action="exit-aim-test">退出训练</button>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderAimFavoriteAction(entryRef, label) {
+  const word = getAimEntryWord(entryRef);
+  if (!word) return "";
+
+  return `
+    <button
+      class="button small ${word.favorite ? "secondary" : "ghost"}"
+      type="button"
+      data-action="toggle-aim-favorite"
+      data-source-list-id="${entryRef.sourceListId}"
+      data-word-id="${entryRef.wordId}"
+    >${word.favorite ? `取消收藏${label}` : `收藏${label}`}</button>
+  `;
+}
+
+function renderAimWordStats(word) {
+  return `
+    <ul class="aim-word-stats">
+      <li><span>答对次数</span><strong>${Number(word.correctCount) || 0}</strong></li>
+      <li><span>答错次数</span><strong>${Number(word.wrongCount) || 0}</strong></li>
+      <li><span>正确率</span><strong>${formatCorrectRate(word)}</strong></li>
+      <li><span>复习等级</span><strong>${Number(word.reviewLevel) || 0}</strong></li>
+      <li><span>下次复习</span><strong>${formatReviewTime(word.nextReviewAt)}</strong></li>
+    </ul>
+  `;
+}
+
+function renderAimResultPage() {
+  const session = state.aimTestSession;
+  const total = session?.words.length || 0;
+  const correct = session?.correctCount || 0;
+  const wrong = session?.wrongCount || 0;
+  const answered = correct + wrong;
+  const accuracy = answered ? Math.round((correct / answered) * 100) : 0;
+  const uniqueWrongCount = uniqueAimEntries(session?.wrongEntries || []).length;
+
+  return `
+    <div class="aim-result-page test-card">
+      <h2>训练完成</h2>
+      <p class="muted">${escapeHtml(session?.title || "射击训练模式")} 已经结束。</p>
+      <div class="finish-score aim-result-grid">
+        <div class="score-box"><strong>${total}</strong><span>总题数</span></div>
+        <div class="score-box"><strong>${correct}</strong><span>正确数</span></div>
+        <div class="score-box"><strong>${wrong}</strong><span>错误数</span></div>
+        <div class="score-box"><strong>${accuracy}%</strong><span>正确率</span></div>
+        <div class="score-box"><strong>${session?.score || 0}</strong><span>最终得分</span></div>
+        <div class="score-box"><strong>${session?.maxCombo || 0}</strong><span>最高连击</span></div>
+        <div class="score-box"><strong>${uniqueWrongCount}</strong><span>本次错题</span></div>
+      </div>
+      <div class="row-actions">
+        <button class="button" data-action="restart-aim-test">再来一轮</button>
+        <button class="button secondary" data-action="exit-aim-test">返回主页</button>
+      </div>
+    </div>
+  `;
+}
+
 // ---------- 事件委托 ----------
 
 app.addEventListener("click", (event) => {
@@ -2049,18 +2921,21 @@ app.addEventListener("click", (event) => {
   if (action === "rename-list") renameList(listId);
   if (action === "delete-list") deleteList(listId);
   if (action === "toggle-help") toggleHelpSection();
-  if (action === "open-combined-settings") openCombinedTestSettings();
+  if (action === "open-combined-settings") openCombinedTestSettings("normal");
+  if (action === "open-aim-settings") openAimTestSettings();
   if (action === "smart-combined-test") startSmartReviewFromHome();
   if (action === "select-all-combined") setAllCombinedLists(true);
   if (action === "clear-combined-selection") setAllCombinedLists(false);
-  if (action === "start-combined-test") startCombinedTest(state.combinedSettings);
+  if (action === "start-combined-test") startCombinedFromSettings();
   if (action === "open-note") openNoteModal(listId, entryId);
   if (action === "close-note") closeNoteModal();
   if (action === "save-note") saveNoteModal();
   if (action === "back-list") {
+    cleanupAimRoundTimers();
     state.currentView = "list";
     state.activeListId = null;
     state.test = null;
+    state.aimTestSession = null;
     state.noteModal = null;
     render();
   }
@@ -2072,9 +2947,31 @@ app.addEventListener("click", (event) => {
   if (action === "start-test") startTest(listId, false);
   if (action === "start-favorite-test") startTest(listId, "favorite");
   if (action === "start-wrong-test") startTest(listId, "wrong");
+  if (action === "start-aim-test") startAimTestForList(listId);
   if (action === "restart-test") restartCurrentTest();
   if (action === "previous-question") previousQuestion();
   if (action === "next-question") nextQuestion();
+  if (action === "aim-target-click") {
+    const optionEntry = state.aimTestSession?.currentOptions?.find(
+      (option) =>
+        option.sourceListId === target.dataset.sourceListId &&
+        option.wordId === target.dataset.wordId
+    );
+    if (optionEntry) handleAimTargetClick(optionEntry);
+  }
+  if (action === "pause-aim-test") pauseAimTest();
+  if (action === "resume-aim-test") resumeAimTest();
+  if (action === "continue-aim-test") continueAimTest();
+  if (action === "restart-aim-test") restartAimTest();
+  if (action === "exit-aim-test") exitAimTest("home");
+  if (action === "back-aim-settings") exitAimTest("settings");
+  if (action === "back-aim-source") exitAimTest("source");
+  if (action === "toggle-aim-favorite") {
+    toggleAimFavorite({
+      sourceListId: target.dataset.sourceListId,
+      wordId: target.dataset.wordId,
+    });
+  }
 });
 
 app.addEventListener("input", (event) => {
@@ -2112,6 +3009,12 @@ app.addEventListener("change", (event) => {
   const scopeInput = event.target.closest("[data-combined-scope]");
   if (scopeInput) {
     updateCombinedScope(scopeInput.value);
+    return;
+  }
+
+  const testFormInput = event.target.closest("[data-combined-test-form]");
+  if (testFormInput) {
+    updateCombinedTestForm(testFormInput.value);
     return;
   }
 
